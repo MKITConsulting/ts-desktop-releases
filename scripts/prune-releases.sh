@@ -4,6 +4,7 @@ set -euo pipefail
 REPO="${PRUNE_REPO:-MKITConsulting/ts-desktop-releases}"
 KEEP_RECENT="${PRUNE_KEEP_RECENT:-10}"
 KEEP_MONTHS="${PRUNE_KEEP_MONTHS:-12}"
+MIN_VERSION="${PRUNE_MIN_VERSION:-}"
 APPLY=0
 ASSUME_YES=0
 PRUNE_DRAFTS=0
@@ -30,6 +31,9 @@ OPTIONS
   --repo OWNER/NAME    Target repository. Default: MKITConsulting/ts-desktop-releases
   --keep-recent N      Keep assets of the N newest stable releases. Default: 10
   --keep-months M      Keep assets of everything published within the last M months. Default: 12
+  --min-version X.Y.Z  Hard floor: prune assets of every release below X.Y.Z even when a
+                       keep rule would otherwise hold it. Use when older builds carry a
+                       vulnerability that must stop being downloadable.
   --prune-drafts       Additionally DELETE stale draft releases outright (draft version
                        <= newest published version). Drafts have no audit value.
   --log-dir DIR        Where to write the audit log on --apply. Default: current directory
@@ -44,9 +48,15 @@ RETENTION POLICY
   Everything else is an asset-prune candidate. Releases with an unparseable tag are
   never touched.
 
+  --min-version overrides recent, minor-tip and fresh — a release below the floor is
+  pruned whatever else applies. updater-latest is the one exception: the release that
+  /releases/latest resolves to is never pruned, because auto-update depends on its
+  assets. Passing a floor above that release is rejected rather than honoured.
+
 EXAMPLES
   scripts/prune-releases.sh
   scripts/prune-releases.sh --keep-recent 15 --keep-months 18
+  scripts/prune-releases.sh --min-version 0.9.4 --keep-recent 5 --keep-months 0
   scripts/prune-releases.sh --apply
   scripts/prune-releases.sh --apply --prune-drafts
 EOF
@@ -63,6 +73,7 @@ parse_args() {
       --repo)         REPO="${2:?--repo needs a value}"; shift 2 ;;
       --keep-recent)  KEEP_RECENT="${2:?--keep-recent needs a value}"; shift 2 ;;
       --keep-months)  KEEP_MONTHS="${2:?--keep-months needs a value}"; shift 2 ;;
+      --min-version)  MIN_VERSION="${2:?--min-version needs a value}"; shift 2 ;;
       --log-dir)      LOG_DIR="${2:?--log-dir needs a value}"; shift 2 ;;
       -h|--help)      usage; exit 0 ;;
       *)              die "unknown option: $1 (try --help)" ;;
@@ -70,8 +81,29 @@ parse_args() {
   done
   case "$KEEP_RECENT" in ''|*[!0-9]*) die "--keep-recent must be a non-negative integer" ;; esac
   case "$KEEP_MONTHS" in ''|*[!0-9]*) die "--keep-months must be a non-negative integer" ;; esac
+  MIN_VERSION="${MIN_VERSION#v}"
+  if [ -n "$MIN_VERSION" ]; then
+    case "$MIN_VERSION" in
+      [0-9]*.[0-9]*.[0-9]*) ;;
+      *) die "--min-version must look like X.Y.Z (got '$MIN_VERSION')" ;;
+    esac
+  fi
   [ "$ASSUME_YES" -eq 1 ] && [ "$APPLY" -eq 0 ] && die "--yes is meaningless without --apply"
   return 0
+}
+
+min_version_json() {
+  [ -z "$MIN_VERSION" ] && { printf 'null'; return 0; }
+  printf '%s' "$MIN_VERSION" | jq -R 'split(".") | map(tonumber)'
+}
+
+assert_floor_below_latest() {
+  local latest_tag="$1"
+  [ -z "$MIN_VERSION" ] && return 0
+  printf '%s' "${latest_tag#v}" | jq -Re \
+    --argjson floor "$(min_version_json)" \
+    'split("-")[0] | split(".") | map(tonumber) | . >= $floor' >/dev/null 2>&1 \
+    || die "--min-version $MIN_VERSION is above the updater-latest release $latest_tag — refusing to prune everything"
 }
 
 preflight() {
@@ -100,7 +132,8 @@ build_plan() {
   printf '%s' "$releases_json" | jq \
     --arg latestTag "$latest_tag" \
     --argjson keepRecent "$KEEP_RECENT" \
-    --argjson keepMonths "$KEEP_MONTHS" '
+    --argjson keepMonths "$KEEP_MONTHS" \
+    --argjson minVersion "$(min_version_json)" '
     def parts: (.tag_name | ltrimstr("v") | split("-")[0] | split("."));
     def ok:    (parts | length) == 3 and (parts | map(test("^[0-9]+$")) | all);
     def sv:    parts | map(tonumber);
@@ -127,15 +160,23 @@ build_plan() {
                  (if ($recent    | index($r.tag_name)) then "recent"      else empty end),
                  (if ($minorTips | index($r.tag_name)) then "minor-tip"   else empty end),
                  (if ($fresh     | index($r.tag_name)) then "fresh"       else empty end) ]) as $why
+            | (($minVersion != null) and (sv < $minVersion)
+               and ($r.tag_name != $latestTag))                as $belowMin
             | { tag:        $r.tag_name,
                 published:  (($r.published_at // "")[0:10]),
                 prerelease: $r.prerelease,
                 count:      ($r.assets | length),
                 bytes:      ($r | bytes),
-                decision:   (if ($why | length) > 0 then "KEEP"
+                decision:   (if $r.tag_name == $latestTag then "KEEP"
+                             elif $belowMin then "PRUNE"
+                             elif ($why | length) > 0 then "KEEP"
                              elif ($r.assets | length) == 0 then "EMPTY"
                              else "PRUNE" end),
-                why:        ($why | join(",")),
+                why:        (if $belowMin then
+                               (if ($why | length) > 0
+                                then "below-min (overrides \($why | join(",")))"
+                                else "below-min" end)
+                             else ($why | join(",")) end),
                 assets:     [$r.assets[].name] }
           )),
         drafts: ($all | map(select(.draft)) | map(
@@ -164,8 +205,12 @@ render_plan() {
   printf '\n'
   printf 'Repository      %s\n' "$REPO"
   printf 'Updater latest  %s  (assets pinned, never pruned)\n' "$(jq -r '.repo_latest' <<<"$plan")"
-  printf 'Policy          keep %s newest stable + minor-line tips + last %s months\n\n' \
+  printf 'Policy          keep %s newest stable + minor-line tips + last %s months\n' \
     "$KEEP_RECENT" "$KEEP_MONTHS"
+  if [ -n "$MIN_VERSION" ]; then
+    printf 'Hard floor      %s  (overrides every keep rule except updater-latest)\n' "$MIN_VERSION"
+  fi
+  printf '\n'
 
   printf '%-12s %-12s %6s %12s  %-8s %s\n' TAG PUBLISHED ASSETS SIZE ACTION REASON
   printf '%s\n' "$(printf '%.0s-' $(seq 1 78))"
@@ -283,6 +328,7 @@ main() {
 
   local latest_tag releases_json plan
   latest_tag="$(resolve_latest_tag)"
+  assert_floor_below_latest "$latest_tag"
   releases_json="$(fetch_releases)"
   plan="$(build_plan "$releases_json" "$latest_tag")"
 
