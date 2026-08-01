@@ -8,7 +8,8 @@ MIN_VERSION="${PRUNE_MIN_VERSION:-}"
 APPLY=0
 ASSUME_YES=0
 PRUNE_DRAFTS=0
-LOG_DIR="${PRUNE_LOG_DIR:-.}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="${PRUNE_LOG_DIR:-${SCRIPT_DIR%/scripts}/audit}"
 
 TMPDIR_SELF=""
 cleanup() { [ -n "$TMPDIR_SELF" ] && rm -rf "$TMPDIR_SELF"; }
@@ -36,7 +37,8 @@ OPTIONS
                        vulnerability that must stop being downloadable.
   --prune-drafts       Additionally DELETE stale draft releases outright (draft version
                        <= newest published version). Drafts have no audit value.
-  --log-dir DIR        Where to write the audit log on --apply. Default: current directory
+  --log-dir DIR        Where to write the audit log on --apply. Default: audit/ next to
+                       this script, so the trail lands in the repository by default.
   -h, --help           This text.
 
 RETENTION POLICY
@@ -168,9 +170,9 @@ build_plan() {
                 count:      ($r.assets | length),
                 bytes:      ($r | bytes),
                 decision:   (if $r.tag_name == $latestTag then "KEEP"
+                             elif ($r.assets | length) == 0 then "EMPTY"
                              elif $belowMin then "PRUNE"
                              elif ($why | length) > 0 then "KEEP"
-                             elif ($r.assets | length) == 0 then "EMPTY"
                              else "PRUNE" end),
                 why:        (if $belowMin then
                                (if ($why | length) > 0
@@ -279,8 +281,10 @@ execute_plan() {
   log="${LOG_DIR%/}/prune-releases-${stamp}.log"
   mkdir -p "${LOG_DIR%/}"
 
-  printf 'repo=%s policy=keep-recent:%s,keep-months:%s latest=%s\n' \
-    "$REPO" "$KEEP_RECENT" "$KEEP_MONTHS" "$(jq -r '.repo_latest' <<<"$plan")" >"$log"
+  printf 'repo=%s date=%s latest=%s\n' \
+    "$REPO" "$stamp" "$(jq -r '.repo_latest' <<<"$plan")" >"$log"
+  printf 'policy=keep-recent:%s,keep-months:%s,min-version:%s,prune-drafts:%s\n' \
+    "$KEEP_RECENT" "$KEEP_MONTHS" "${MIN_VERSION:-none}" "$PRUNE_DRAFTS" >>"$log"
 
   local failures=0
   while IFS=$'\t' read -r tag asset; do
